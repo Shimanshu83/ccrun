@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"syscall"
@@ -40,16 +41,43 @@ func parseCommandArgs(args []string) {
 
 func run() {
 
-	/* spawning a new child process here  */
-	// cmd := exec.Command(args[2], args[3:]...)
 	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
 	cmd.Env = append(os.Environ(), "IS_CHILD=1")
 
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS,
+	if err := makeDir(ROOTFS_DIR); err != nil {
+		panic(err)
 	}
 
-	/* attaching parent process i/o to child process i/o */
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWUTS |
+			syscall.CLONE_NEWPID |
+			syscall.CLONE_NEWNS |
+			syscall.CLONE_NEWNET |
+			syscall.CLONE_NEWNET |
+			syscall.CLONE_NEWCGROUP,
+	}
+
+	if err := syscall.Mount("", "/", "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
+		log.Fatal("failed to make / rslave:", err)
+	}
+
+	if err := syscall.Mount(ROOTFS_DIR, ROOTFS_DIR, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		log.Fatal("failed to rbind rootfs:", err)
+	}
+
+	if err := syscall.Mount("", ROOTFS_DIR, "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
+		log.Fatal("failed to make rootfs private:", err)
+	}
+
+	procPath := ROOTFS_DIR + "/proc"
+	if err := os.MkdirAll(procPath, 0755); err != nil {
+		log.Fatal("failed to create proc dir:", err)
+	}
+
+	if err := syscall.Mount("proc", procPath, "proc", 0, ""); err != nil {
+		log.Fatal("failed to mount proc:", err)
+	}
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
