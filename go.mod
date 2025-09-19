@@ -1,3 +1,3 @@
-module go_process
+module ccrun
 
 go 1.22.1

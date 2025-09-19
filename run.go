@@ -1,10 +1,13 @@
 package main
 
-import "os"
+import (
+	"os"
+)
 
 const (
-	CONTAINER_DIR = "/opt/ccrun"
-	ROOTFS_DIR    = "/opt/ccrun/rootfs"
+	CONTAINER_DIR  = "/opt/ccrun"
+	ROOTFS_DIR     = "/opt/ccrun/rootfs"
+	CONTAINER_NAME = "ccrun"
 )
 
 func prepareFile() error {
@@ -19,7 +22,6 @@ func prepareFile() error {
 }
 
 func makeDir(path string) error {
-
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return os.MkdirAll(path, 0755)
 	} else {

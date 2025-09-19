@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -18,7 +18,7 @@ func main() {
 
 func parseCommandArgs(args []string) {
 
-	fmt.Println("total number of time this started")
+	fmt.Println("Container started <->")
 	fmt.Println("args", os.Args)
 
 	if len(args) < 2 {
@@ -48,6 +48,10 @@ func run() {
 		panic(err)
 	}
 
+	if err := setupContainerNetworkingFiles(CONTAINER_DIR); err != nil {
+		panic(err)
+	}
+
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUTS |
 			syscall.CLONE_NEWPID |
@@ -55,6 +59,7 @@ func run() {
 			syscall.CLONE_NEWNET |
 			syscall.CLONE_NEWNET |
 			syscall.CLONE_NEWCGROUP,
+		Unshareflags: syscall.CLONE_NEWNS,
 	}
 
 	if err := syscall.Mount("", "/", "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
@@ -78,6 +83,18 @@ func run() {
 		log.Fatal("failed to mount proc:", err)
 	}
 
+	// if err := setupSysAndCgroup(ROOTFS_DIR); err != nil {
+	// log.Fatal("error while mounting sys and cgrougp %w", err)
+	// }
+	if err := bindEtcFiles(ROOTFS_DIR, CONTAINER_DIR); err != nil {
+
+		log.Fatal("failed to mount etc files %w", err)
+	}
+
+	if err := setupSysAndCgroup(ROOTFS_DIR); err != nil {
+		log.Fatal("failed to mount root dir %w", err)
+	}
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -93,12 +110,137 @@ func child() {
 	if err := syscall.Sethostname([]byte("container")); err != nil {
 		panic(err)
 	}
+	if err := switchRoot(ROOTFS_DIR); err != nil {
+		log.Fatal("error while pivoting a root %w", err)
+	}
+
 	cmd := exec.Command(os.Args[2], os.Args[3:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	time.Sleep(time.Minute * 45)
-
 	cmd.Run()
+}
+
+func setupSysAndCgroup(rootfs string) error {
+	// Create $ROOTFS_DIR/sys
+	sysDir := rootfs + "/sys"
+	if err := os.MkdirAll(sysDir, 0755); err != nil {
+		return fmt.Errorf("failed to create sys dir: %w", err)
+	}
+
+	// Mount sysfs -> $ROOTFS_DIR/sys
+	if err := exec.Command("mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", sysDir).Run(); err != nil {
+		return fmt.Errorf("failed to mount sysfs: %w", err)
+	}
+
+	// Create $ROOTFS_DIR/sys/fs/cgroup
+	cgroupDir := sysDir + "/fs/cgroup"
+	if err := os.MkdirAll(cgroupDir, 0755); err != nil {
+		return fmt.Errorf("failed to create cgroup dir: %w", err)
+	}
+
+	// Mount cgroup2 -> $ROOTFS_DIR/sys/fs/cgroup
+	if err := exec.Command("mount", "-t", "cgroup2", "-o", "ro,nosuid,nodev,noexec", "cgroup2", cgroupDir).Run(); err != nil {
+		return fmt.Errorf("failed to mount cgroup2: %w", err)
+	}
+
+	return nil
+}
+
+func setupContainerNetworkingFiles(containerDir string) error {
+
+	hostsContent := `127.0.0.1       localhost container-2
+					::1             localhost ip6-localhost ip6-loopback `
+
+	if err := os.WriteFile(containerDir+"/hosts", []byte(hostsContent), 0644); err != nil {
+		return fmt.Errorf("failed to write hosts: %w", err)
+	}
+
+	// 2. Write /etc/hostname equivalent
+	hostnameContent := CONTAINER_NAME
+
+	if err := os.WriteFile(containerDir+"/hostname", []byte(hostnameContent), 0644); err != nil {
+		return fmt.Errorf("failed to write hostname: %w", err)
+	}
+
+	// copying a resolve.conf file from host to docker container
+	src, err := os.Open("/etc/resolv.conf")
+	if err != nil {
+		return fmt.Errorf("failed to open resolv.conf: %w", err)
+	}
+	defer src.Close()
+
+	dst, err := os.Create(containerDir + "/resolv.conf")
+	if err != nil {
+		return fmt.Errorf("failed to create container resolv.conf: %w", err)
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("failed to copy resolv.conf: %w", err)
+	}
+
+	return nil
+}
+
+func bindEtcFiles(rootfsDir, containerDir string) error {
+	files := []string{"hostname", "hosts", "resolv.conf"}
+
+	for _, p := range files {
+		target := rootfsDir + "/etc/" + p
+		source := containerDir + "/" + p
+
+		// Ensure the target file exists (like `touch`)
+		if _, err := os.Stat(target); os.IsNotExist(err) {
+			if f, err := os.Create(target); err != nil {
+				return fmt.Errorf("failed to create %s: %w", target, err)
+			} else {
+				f.Close()
+			}
+		}
+
+		// Bind mount source -> target
+		cmd := exec.Command("mount", "--bind", source, target)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to bind %s to %s: %w", source, target, err)
+		}
+	}
+
+	return nil
+}
+
+func switchRoot(newRoot string) error {
+	// Step 1: make rootfs rslave so mounts don’t propagate back to the host
+	if err := syscall.Mount("", "/", "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
+		return err
+	}
+
+	// Step 2: create /.oldroot inside newRoot
+	oldRoot := newRoot + "/.oldroot"
+	if err := os.MkdirAll(oldRoot, 0700); err != nil {
+		return err
+	}
+
+	// Step 3: pivot_root(newRoot, oldRoot)
+	if err := syscall.PivotRoot(newRoot, oldRoot); err != nil {
+		return err
+	}
+
+	// Step 4: change directory to new root "/"
+	if err := os.Chdir("/"); err != nil {
+		return err
+	}
+
+	// Step 5: unmount old root
+	if err := syscall.Unmount("/.oldroot", syscall.MNT_DETACH); err != nil {
+		return err
+	}
+
+	// Step 6: remove /.oldroot directory
+	if err := os.RemoveAll("/.oldroot"); err != nil {
+		return err
+	}
+
+	return nil
 }
